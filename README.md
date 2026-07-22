@@ -2,10 +2,9 @@
 npm install
 
 # 调试
-**桌面端调试**
-<br>
+##桌面端调试
 npm start
-**Web端调试**
+##Web端调试
 npm run web
 
 # 桌面应用打包
