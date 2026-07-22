@@ -1,0 +1,94 @@
+{
+  "name": "susumusic",
+  "productName": "Susumusic",
+  "version": "1.1.2",
+  "description": "沉浸式音乐播放器，融合天气电台、歌词舞台、粒子视觉和 3D 歌单架。",
+  "author": "Susumusic",
+  "main": "desktop/main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "web": "node server.js",
+    "build:win": "electron-builder --win nsis",
+    "build:win:dir": "electron-builder --win dir"
+  },
+  "build": {
+    "appId": "com.susumusic.desktop",
+    "productName": "Susumusic",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "afterPack": "build/after-pack.js",
+    "toolsets": {
+      "winCodeSign": "1.1.0"
+    },
+    "files": [
+      "desktop/**/*",
+      "public/**/*",
+      "build/**/*",
+      "server.js",
+      "dj-analyzer.js",
+      "package.json",
+      "!public/index.*.html",
+      "public/index.html"
+    ],
+    "asar": false,
+    "win": {
+      "executableName": "Susumusic",
+      "icon": "build/icon.ico",
+      "signAndEditExecutable": false,
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Susumusic",
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "include": "build/installer.nsh",
+      "artifactName": "Susumusic-${version}-Setup.${ext}"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "Susuzmx",
+        "repo": "Susumusic"
+      }
+    ]
+  },
+  "susumusic": {
+    "update": {
+      "provider": "github",
+      "owner": "Susuzmx",
+      "repo": "Susumusic",
+      "preview": true,
+      "preferMirrors": true,
+      "mirrors": [
+        "https://gh.llkk.cc/",
+        "https://ghfast.top/",
+        "https://gh-proxy.com/"
+      ]
+    }
+  },
+  "dependencies": {
+    "gsap": "^3.15.0",
+    "mpg123-decoder": "^1.0.3",
+    "NeteaseCloudMusicApi": "^4.32.0"
+  },
+  "devDependencies": {
+    "electron": "^42.4.1",
+    "electron-builder": "^26.15.3",
+    "rcedit": "^5.0.2"
+  }
+}

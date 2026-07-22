@@ -1,0 +1,750 @@
+/**
+ * particle-behavior.js — 粒子行为系统  v1.1
+ *
+ * 负责将 AudioReactive.js 提供的原始音频特征（kick/drop/rms/bass/flux）
+ * 转化为完整的粒子动画语言，写入 window.uniforms：
+ *
+ *  uBreath       呼吸相位  0-2π         → 粒子整体缩放的正弦驱动
+ *  uBreathAmt    呼吸幅度  0-1          → 低能柔和 / 高潮剧烈
+ *  uSpring       弹簧位移  -1 to 1      → Beat Pulse 弹性冲击
+ *  uHiHat        高频闪烁  0-1          → Treble 驱动微粒 Spark
+ *  uVocal        人声流场  0-1          → 中频驱动丝绸旋转
+ *  uDropGather   聚集强度  0-1          → Drop 前粒子向心聚集
+ *  uDropBurst    爆发强度  0-1          → Drop 爆炸释放
+ *  uChorus       副歌强度  0-1          → 副歌扩张 + 额外粒子淡入
+ *  uShockRing    冲击波强度 0-1         → Bass 驱动环形冲击波
+ *  uShockRadius  冲击波半径 0-4         → 冲击波当前半径（世界坐标）
+ *
+ * 依赖：
+ *   window.AudioReactive  (audio-reactive.js 必须先加载)
+ *   window.uniforms       (app.js 中的 Three.js uniforms)
+ *
+ * API：
+ *   ParticleBehavior.tick(dt)   每帧调用（在 AudioReactive.tick 之后）
+ *   ParticleBehavior.reset()    切歌时调用
+ *   ParticleBehavior.state      只读状态快照
+ */
+(function (g) {
+  'use strict';
+
+  /* ══════════════════════════════════════════════════════════════
+   *  工具
+   * ════════════════════════════════════════════════════════════ */
+  function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+  function clamp01(v) { return clamp(v, 0, 1); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+
+  /** 非对称一阶 IIR（模拟 A/R 包络） */
+  function follow(cur, tgt, attackTau, releaseTau, dt) {
+    var tau = tgt > cur ? attackTau : releaseTau;
+    return cur + (tgt - cur) * (1 - Math.exp(-dt / Math.max(0.001, tau)));
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+   *  弹簧物理  (underdamped harmonic oscillator)
+   *
+   *  ω₀ = 20 rad/s → 自然频率约 3Hz，视觉弹感明显
+   *  ζ  = 0.24     → 欠阻尼，Overshoot 约 1.4 倍峰值
+   * ════════════════════════════════════════════════════════════ */
+  var SP_OMEGA  = 20;    // rad/s
+  var SP_ZETA   = 0.24;  // 降低阻尼 → 更明显的回弹
+  var springPos = 0;
+  var springVel = 0;
+
+  function tickSpring(dt) {
+    var a = -SP_OMEGA * SP_OMEGA * springPos - 2 * SP_ZETA * SP_OMEGA * springVel;
+    springVel += a * dt;
+    springPos += springVel * dt;
+    springPos = clamp(springPos, -1.0, 2.2);   // 允许更大位移
+    springVel = clamp(springVel, -18, 18);
+  }
+
+  /** 给弹簧施加一个速度冲量（kick → 粒子向外弹） */
+  function kickSpring(strength) {
+    springVel += strength * 14.0;   // 冲量加大
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+   *  呼吸系统
+   * ════════════════════════════════════════════════════════════ */
+  var breathPhase  = 0;
+  var breathRate   = 0.35;
+  var breathAmt    = 0.06;
+
+  function tickBreath(dt, energy, bpm) {
+    var energyRate = 0.22 + energy * 1.10;              // 更高上限
+    var bpmRate    = bpm > 30 ? bpm / 240 : 0.40;
+    var targetRate = lerp(energyRate, bpmRate, 0.45);
+    breathRate = follow(breathRate, targetRate, 1.5, 2.5, dt);
+
+    if (energy > 0.65) {
+      var fastRate = bpm > 30 ? bpm / 120 : 0.8;
+      breathRate = follow(breathRate, fastRate, 0.7, 2.0, dt);
+    }
+
+    breathPhase += breathRate * dt * 2 * Math.PI;
+    if (breathPhase > 2 * Math.PI) breathPhase -= 2 * Math.PI;
+
+    // 幅度：平时极轻柔(0.05)，高潮最大约 0.38（足够驱动明显的噪声漂移）
+    var targetAmt = 0.05 + energy * 0.85;
+    breathAmt = follow(breathAmt, targetAmt, 0.40, 0.80, dt);
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+   *  BPM 估算
+   * ════════════════════════════════════════════════════════════ */
+  var bpmEstimate  = 120;
+  var bpmKickTimes = [];
+  var prevKickVal  = 0;
+  var globalTime   = 0;
+
+  function updateBpmFromKick(kickVal, dt) {
+    globalTime += dt;
+    var threshold = 0.45;   // 降低触发阈值
+    if (kickVal > threshold && prevKickVal <= threshold) {
+      bpmKickTimes.push(globalTime);
+      if (bpmKickTimes.length > 8) bpmKickTimes.shift();
+      if (bpmKickTimes.length >= 3) {
+        var intervals = [];
+        for (var i = 1; i < bpmKickTimes.length; i++) {
+          var gap = bpmKickTimes[i] - bpmKickTimes[i - 1];
+          if (gap > 0.25 && gap < 2.0) intervals.push(gap);
+        }
+        if (intervals.length >= 2) {
+          var avg = intervals.reduce(function(a,b){return a+b;}) / intervals.length;
+          var newBpm = 60 / avg;
+          bpmEstimate = follow(bpmEstimate, clamp(newBpm, 40, 200), 2.0, 5.0, dt);
+        }
+      }
+    }
+    prevKickVal = kickVal;
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+   *  Hi-Hat 闪烁追踪
+   * ════════════════════════════════════════════════════════════ */
+  var hihatSmooth = 0;
+
+  function tickHiHat(treble, dt) {
+    // 降低起跳阈值，更容易触发
+    var target = clamp01((treble - 0.04) / 0.32);
+    hihatSmooth = follow(hihatSmooth, target, 0.03, 0.14, dt);
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+   *  人声流场追踪
+   * ════════════════════════════════════════════════════════════ */
+  var vocalSmooth = 0;
+
+  function tickVocal(mid, bass, dt) {
+    var vocalRaw = clamp01((mid - 0.10) / 0.30) * clamp01(1.0 - bass * 1.0);
+    vocalSmooth = follow(vocalSmooth, vocalRaw, 0.18, 0.45, dt);
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+   *  Bass 冲击波环系统（最多 4 个并发）
+   * ════════════════════════════════════════════════════════════ */
+  var SHOCK_SPEED = 3.5;    // 加快扩散速度
+  var shockwaves  = [];
+  var prevBassVal = 0;
+  var bassOnsetCooldown = 0;
+
+  function tickShockwaves(bassVal, dt) {
+    bassOnsetCooldown = Math.max(0, bassOnsetCooldown - dt);
+
+    var bassRise = Math.max(0, bassVal - prevBassVal);
+    // 降低触发门限，让冲击波更容易出现
+    if (bassRise > 0.040 && bassVal > 0.18 && bassOnsetCooldown <= 0) {
+      shockwaves.push({
+        radius: 0.05,
+        strength: clamp01(bassRise * 7.0 + bassVal * 0.6),   // 更强初始强度
+        age: 0
+      });
+      if (shockwaves.length > 4) shockwaves.shift();
+      bassOnsetCooldown = 0.14;  // 140ms 冷却
+    }
+    prevBassVal = lerp(prevBassVal, bassVal, 0.28);
+
+    for (var i = shockwaves.length - 1; i >= 0; i--) {
+      var sw = shockwaves[i];
+      sw.radius += SHOCK_SPEED * dt;
+      sw.strength *= Math.pow(0.08, dt);   // 稍快衰减，让每次冲击更清晰
+      sw.age += dt;
+      if (sw.strength < 0.006 || sw.radius > 5.0) {
+        shockwaves.splice(i, 1);
+      }
+    }
+
+    var best = null;
+    for (var j = 0; j < shockwaves.length; j++) {
+      if (!best || shockwaves[j].strength > best.strength) best = shockwaves[j];
+    }
+    if (best) return { ring: best.strength, radius: best.radius };
+    return null;
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+   *  副歌状态追踪
+   * ════════════════════════════════════════════════════════════ */
+  var chorusLevel = 0;
+  var chorusPeak  = 0;
+
+  function tickChorus(dropVal, energy, dt) {
+    // 降低触发阈值：0.18 开始，0.55 达到满值
+    var target = dropVal > 0.18 ? clamp01((dropVal - 0.18) / 0.37) : 0;
+    chorusLevel = follow(chorusLevel, target, 0.45, 1.2, dt);
+    chorusPeak = Math.max(chorusPeak * Math.pow(0.992, dt * 60), chorusLevel);
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+   *  Drop 序列状态机
+   *
+   *  触发条件：drop > 0.60，kick > 0.42，持续 0.8s，冷却 6s
+   * ════════════════════════════════════════════════════════════ */
+  var DROP_PHASE_DUR = { GATHER: 0.22, HOLD: 0.14, BURST: 0.22, RELEASE: 1.40 };
+
+  var dropState         = 'IDLE';
+  var dropPhaseTimer    = 0;
+  var dropGatherVal     = 0;
+  var dropBurstVal      = 0;
+  var lastDropAt        = -20;
+  var chorusSustainTime = 0;
+
+  /* ── 爆发残留 / 热焰色温 / 涡旋 ─────────────────────────────── */
+  var burstResidue      = 0;   // Drop 爆发后缓慢衰减（~2.8s），驱动粒子漂移恢复
+  var heatGlow          = 0;   // 色温：1=炽白橙，→0=冷却蓝（爆发后渐冷）
+  var vortexSpin        = 0;   // 副歌涡旋强度 0-1
+  var _prevDropVal      = 0;   // 上帧 dropVal，用于快速上升沿检测
+
+  function triggerDrop() {
+    if (dropState !== 'IDLE') return;
+    dropState      = 'GATHER';
+    dropPhaseTimer = 0;
+    lastDropAt     = globalTime;
+    _triggerFlash(1.0);
+  }
+
+  function tickDropSequence(dropVal, kickVal, dt) {
+    dropPhaseTimer += dt;
+
+    if (dropState === 'IDLE') {
+      // 降低触发阈值：drop > 0.32，kick > 0.30，副歌持续 0.5s，冷却 4s
+      if (chorusSustainTime > 0.50 && dropVal > 0.32 && kickVal > 0.30 &&
+          globalTime - lastDropAt > 4.0) {
+        triggerDrop();
+      }
+      chorusSustainTime = dropVal > 0.18 ? chorusSustainTime + dt : 0;
+    }
+
+    // ── 补充路径：uDrop 快速上升时直接 spike burstResidue/heatGlow ──
+    // 不依赖状态机，保证任何高潮时刻都能看到色温和残留效果
+    // 注意：使用「每秒上升速率」而非每帧绝对差值，确保 60fps/30fps 行为一致
+    var dropRise = Math.max(0, dropVal - _prevDropVal);
+    var dropRiseRate = dropRise / dt;    // 每秒速率，消除帧率依赖
+    if (dropRiseRate > 0.30 && dropVal > 0.18) {
+      // spikeStrength：速率越快、当前值越高，spike 越大（0-1）
+      var spikeStrength = clamp01(dropRiseRate * 0.55 + dropVal * 0.45);
+      if (spikeStrength > burstResidue * 0.6) {
+        burstResidue = Math.max(burstResidue, spikeStrength * 0.78);
+      }
+      if (spikeStrength > heatGlow * 0.6) {
+        heatGlow = Math.max(heatGlow, spikeStrength * 0.68);
+      }
+    }
+    _prevDropVal = dropVal;
+
+    switch (dropState) {
+      case 'GATHER':
+        dropGatherVal = clamp01(dropPhaseTimer / DROP_PHASE_DUR.GATHER);
+        dropBurstVal  = 0;
+        if (dropPhaseTimer >= DROP_PHASE_DUR.GATHER) {
+          dropState = 'HOLD'; dropPhaseTimer = 0;
+        }
+        break;
+
+      case 'HOLD':
+        dropGatherVal = 1.0;
+        dropBurstVal  = 0;
+        if (dropPhaseTimer >= DROP_PHASE_DUR.HOLD) {
+          dropState = 'BURST'; dropPhaseTimer = 0;
+          kickSpring(7.0);     // 大幅增强爆发弹簧冲量
+          _triggerFlash(1.0);
+          // ── 触发爆发残留 & 热焰色温 ───────────────────────────
+          burstResidue = 1.0;
+          heatGlow     = 1.0;
+        }
+        break;
+
+      case 'BURST':
+        var burstT     = clamp01(dropPhaseTimer / DROP_PHASE_DUR.BURST);
+        dropGatherVal  = 1.0 - burstT;
+        dropBurstVal   = clamp01(burstT * 3.8);   // 爆发峰值更高
+        if (dropPhaseTimer >= DROP_PHASE_DUR.BURST) {
+          dropState = 'RELEASE'; dropPhaseTimer = 0;
+        }
+        break;
+
+      case 'RELEASE':
+        dropGatherVal = 0;
+        dropBurstVal  = follow(dropBurstVal, 0, 0.001, DROP_PHASE_DUR.RELEASE, dt);
+        if (dropPhaseTimer >= DROP_PHASE_DUR.RELEASE) {
+          dropState    = 'IDLE';
+          dropGatherVal = 0;
+          dropBurstVal  = 0;
+        }
+        break;
+
+      default:
+        dropState = 'IDLE';
+        dropGatherVal = 0;
+        dropBurstVal  = 0;
+    }
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+   *  ★ 高潮爆炸再生系统（Chorus Burst System）
+   *
+   *  触发逻辑（双路径，互为补充）：
+   *    路径 A：uDrop 快速上升沿（dropRiseRate > 0.45 且 dropVal > 0.25）
+   *            → 任何高潮开始时都能捕获
+   *    路径 B：长期高潮维持（chorusLevel > 0.55 持续 1.5s）
+   *            → 副歌段落稳定时周期性触发（最小间隔 3s）
+   *
+   *  状态机：IDLE → BURST（0.28s 快速衰减）→ REGATHER（2.2s 慢回位）→ IDLE
+   *
+   *  输出 uniforms：
+   *    uCBurst    : 爆炸脉冲 0-1
+   *    uCWhite    : 曝白强度 0-1（快速 flash）
+   *    uCRegather : 内聚再生 0-1（慢衰减）
+   *    uCKickBoost: 副歌 kick 增强 0-1
+   * ════════════════════════════════════════════════════════════ */
+  var CB_STATE    = 'IDLE';   // IDLE / BURST / REGATHER
+  var cbTimer     = 0;
+  var cBurstVal   = 0;        // uCBurst 原始值（快速脉冲）
+  var cWhiteVal   = 0;        // uCWhite（DOM + shader 双重曝白）
+  var cRegatherVal= 0;        // uCRegather（慢回位）
+  var cKickBoost  = 0;        // uCKickBoost（chorus 期间 kick 增强）
+  var lastCBurstAt= -30;      // 上次触发时间，用于冷却
+  var cbChorusSustain = 0;    // 高潮维持计时（路径 B）
+  var _cbDropPrev = 0;        // 上帧 dropVal
+
+  var CB_BURST_DUR    = 0.70; // 爆炸脉冲持续时间（秒）0.28→0.70，让效果有时间显现
+  var CB_REGATHER_DUR = 2.80; // 内聚再生持续时间（秒）2.20→2.80
+  var CB_COOLDOWN     = 2.20; // 最小触发间隔（秒）3.00→2.20，更频繁响应
+
+  function _triggerChorusBurst(strength) {
+    if (CB_STATE !== 'IDLE') return;
+    if (globalTime - lastCBurstAt < CB_COOLDOWN) return;
+    CB_STATE       = 'BURST';
+    cbTimer        = 0;
+    lastCBurstAt   = globalTime;
+    // 爆炸初始强度
+    cBurstVal      = clamp01(strength);
+    cWhiteVal      = clamp01(strength * 0.92);
+    // 触发 DOM 屏幕曝白（叠加到现有 flash）
+    _triggerFlash(strength * 0.85);
+    _triggerVignette(strength * 0.60);
+  }
+
+  function tickChorusBurst(dropVal, kickVal, dt) {
+    // ── uCKickBoost：副歌期间 kick 增强（与状态机无关）────────
+    var kickBoostTarget = clamp01((chorusLevel - 0.20) / 0.45) * 1.0;
+    cKickBoost = follow(cKickBoost, kickBoostTarget, 0.20, 0.60, dt);
+
+    // ── 触发路径 A：drop 快速上升沿 ─────────────────────────
+    var dropRise = Math.max(0, dropVal - _cbDropPrev);
+    var dropRiseRate = dropRise / Math.max(0.001, dt);
+    // 阈值降低：0.45→0.18，dropVal 要求：0.25→0.12，覆盖更多风格的音乐
+    if (CB_STATE === 'IDLE' && dropRiseRate > 0.18 && dropVal > 0.12) {
+      var sA = clamp01(dropRiseRate * 0.55 + dropVal * 0.65);
+      _triggerChorusBurst(Math.max(0.65, sA)); // 最低强度 0.65，保证效果明显
+    }
+
+    // ── 触发路径 B：高潮维持触发 ────────────────────────────
+    // chorusLevel 阈值：0.55→0.28，持续要求：1.5s→0.8s
+    if (chorusLevel > 0.28) {
+      cbChorusSustain += dt;
+    } else {
+      cbChorusSustain *= Math.pow(0.40, dt); // 衰减放慢：0.12→0.40
+    }
+    if (CB_STATE === 'IDLE' && cbChorusSustain > 0.8 &&
+        globalTime - lastCBurstAt > CB_COOLDOWN * 1.2) {
+      var sB = clamp01(chorusLevel * 0.90 + (kickVal > 0.30 ? 0.25 : 0.10));
+      _triggerChorusBurst(Math.max(0.60, sB));
+    }
+
+    // ── 触发路径 C（新增）：kick 强命中且处于副歌期间 ───────
+    // 当 chorusLevel > 0.25 且 kick 很强时直接触发，对重拍音乐更敏感
+    if (CB_STATE === 'IDLE' && chorusLevel > 0.25 && kickVal > 0.65 &&
+        globalTime - lastCBurstAt > CB_COOLDOWN) {
+      _triggerChorusBurst(clamp01(kickVal * 0.80 + chorusLevel * 0.40));
+    }
+    _cbDropPrev = dropVal;
+
+    // ── 状态机推进 ────────────────────────────────────────────
+    cbTimer += dt;
+    if (CB_STATE === 'BURST') {
+      // 爆炸脉冲：快速衰减（pow 曲线，快速收缩感）
+      var burstT  = clamp01(cbTimer / CB_BURST_DUR);
+      // ease-out: 1 → 0 加速衰减
+      cBurstVal   = clamp01((1.0 - burstT) * (1.0 - burstT));
+      // 白色 flash 比爆炸衰减更快（先白后散）
+      cWhiteVal   = clamp01((1.0 - burstT * 1.6));
+      if (cbTimer >= CB_BURST_DUR) {
+        CB_STATE     = 'REGATHER';
+        cbTimer      = 0;
+        cBurstVal    = 0;
+        cWhiteVal    = 0;
+        cRegatherVal = 1.0;  // 内聚再生从满值开始慢衰减
+      }
+    } else if (CB_STATE === 'REGATHER') {
+      // 内聚再生：线性慢衰减
+      var regatherT = clamp01(cbTimer / CB_REGATHER_DUR);
+      cRegatherVal  = 1.0 - regatherT;
+      if (cbTimer >= CB_REGATHER_DUR) {
+        CB_STATE     = 'IDLE';
+        cRegatherVal = 0;
+      }
+    } else {
+      // IDLE 时快速清零（防止残留）
+      cBurstVal    *= Math.pow(0.01, dt);
+      cWhiteVal    *= Math.pow(0.01, dt);
+      cRegatherVal *= Math.pow(0.05, dt);
+    }
+  }
+
+
+  var _flashEl = null;
+  function _getFlashEl() {
+    if (_flashEl && _flashEl.parentNode) return _flashEl;
+    _flashEl = document.createElement('div');
+    _flashEl.id = 'pb-drop-flash';
+    _flashEl.style.cssText = [
+      'position:fixed', 'inset:0', 'pointer-events:none', 'z-index:9999',
+      'opacity:0',
+      'background:radial-gradient(ellipse 90% 70% at 50% 50%,',
+      '  rgba(255,255,255,0.28) 0%, rgba(200,220,255,0.14) 35%, transparent 70%)',
+    ].join(';');
+    document.body.appendChild(_flashEl);
+    return _flashEl;
+  }
+
+  /** 暗晕脉冲：边缘加深 / 中心突显，与亮闪形成对比 */
+  var _vignetteEl = null;
+  function _getVignetteEl() {
+    if (_vignetteEl && _vignetteEl.parentNode) return _vignetteEl;
+    _vignetteEl = document.createElement('div');
+    _vignetteEl.id = 'pb-vignette';
+    _vignetteEl.style.cssText = [
+      'position:fixed', 'inset:0', 'pointer-events:none', 'z-index:9998',
+      'opacity:0',
+      'background:radial-gradient(ellipse 80% 75% at 50% 50%,',
+      '  transparent 30%, rgba(0,0,0,0.38) 68%, rgba(0,0,0,0.72) 100%)',
+    ].join(';');
+    document.body.appendChild(_vignetteEl);
+    return _vignetteEl;
+  }
+
+  /** 触发暗晕（Bass / Kick 命中时调用）
+   *  strength 0-1；与亮闪同触发但衰减更慢，营造心跳收缩感
+   */
+  function _triggerVignette(strength) {
+    var el = _getVignetteEl();
+    el.style.transition = 'none';
+    el.style.opacity = String(Math.min(0.90, (strength || 0.5) * 0.85));
+    clearTimeout(el._vt);
+    el._vt = setTimeout(function () {
+      el.style.transition = 'opacity 0.80s cubic-bezier(0.16,1,0.3,1)';
+      el.style.opacity = '0';
+    }, 40);
+  }
+
+  function _triggerFlash(strength) {
+    var el = _getFlashEl();
+    el.style.transition = 'none';
+    el.style.opacity = String(Math.min(0.98, (strength || 1) * 0.95));
+    clearTimeout(el._ft);
+    el._ft = setTimeout(function () {
+      el.style.transition = 'opacity 0.55s cubic-bezier(0.16,1,0.3,1)';
+      el.style.opacity = '0';
+    }, 35);
+    var uni = g.uniforms;
+    if (uni && uni.uBloomStrength) {
+      uni.uBloomStrength.value = Math.min(2.4, uni.uBloomStrength.value + strength * 1.10);
+    }
+    if (uni && uni.uBurstAmt) {
+      uni.uBurstAmt.value = Math.min(1.0, uni.uBurstAmt.value + strength * 0.95);
+    }
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+   *  写入 uniforms
+   *  效果强度 = params（用户手动调节）× adapt（音乐自适应）× M（总开关）
+   * ════════════════════════════════════════════════════════════ */
+  function _writeUniforms(shock) {
+    var uni = g.uniforms;
+    if (!uni) return;
+    var M = params.enabled ? params.master : 0;
+    var AR = g.AudioReactive;
+    if (uni.uBreath)      uni.uBreath.value      = breathPhase;
+    if (uni.uBreathAmt)   uni.uBreathAmt.value    = breathAmt  * params.breath  * adapt.breath  * M;
+    if (uni.uSpring)      uni.uSpring.value       = springPos  * params.kick    * adapt.kick    * M;
+    if (uni.uHiHat)       uni.uHiHat.value        = hihatSmooth * params.hihat  * adapt.hihat   * M;
+    if (uni.uVocal)       uni.uVocal.value        = vocalSmooth * params.vocal  * adapt.vocal   * M;
+    if (uni.uDropGather)  uni.uDropGather.value   = dropGatherVal * params.drop * M;
+    if (uni.uDropBurst)   uni.uDropBurst.value    = dropBurstVal  * params.drop * M;
+    if (uni.uChorus)      uni.uChorus.value       = chorusLevel   * params.chorus * adapt.chorus * M;
+    // 新：爆发残留 / 热焰色温 / 副歌涡旋
+    if (uni.uBurstResidue) uni.uBurstResidue.value = burstResidue * params.drop   * M;
+    if (uni.uHeatGlow)     uni.uHeatGlow.value     = heatGlow     * params.drop   * M;
+    if (uni.uVortex)       uni.uVortex.value        = vortexSpin   * params.chorus * adapt.chorus * M;
+    // uSnare：从 AudioReactive.state 读原始值，乘用户乘数后写入
+    if (uni.uSnare && AR && AR.state) {
+      uni.uSnare.value = AR.state.snare * params.snare * M;
+    }
+    // ★ 高潮爆炸再生系统 uniforms（全局，不受 params 压制）
+    if (uni.uCBurst)     uni.uCBurst.value     = cBurstVal    * M;
+    if (uni.uCWhite)     uni.uCWhite.value      = cWhiteVal    * M;
+    if (uni.uCRegather)  uni.uCRegather.value   = cRegatherVal * M;
+    if (uni.uCKickBoost) uni.uCKickBoost.value  = cKickBoost   * M;
+    if (shock) {
+      if (uni.uShockRing)   uni.uShockRing.value   = shock.ring * params.bass * adapt.bass * M;
+      if (uni.uShockRadius) uni.uShockRadius.value  = shock.radius;
+    } else {
+      if (uni.uShockRing)   uni.uShockRing.value  *= Math.pow(0.04, 0.016);
+    }
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+   *  外部可控参数（由视觉控制台写入）
+   *  所有值均为乘数：0=关闭  1=默认  2=双倍
+   * ════════════════════════════════════════════════════════════ */
+  var params = {
+    enabled : true,   // 总开关
+    master  : 1.0,    // 整体强度
+    kick    : 1.0,    // 鼓点冲击
+    breath  : 1.0,    // 呼吸幅度
+    bass    : 1.0,    // Bass 冲击波
+    hihat   : 1.0,    // 高频闪烁
+    vocal   : 1.0,    // 人声流场
+    chorus  : 1.0,    // 副歌扩张
+    drop    : 1.0,    // Drop 爆发
+    snare   : 1.0,    // Snare 打击扭切
+    adapt   : true,   // 音乐自适应（自动调整效果乘数）
+  };
+
+  /** 外部调用：覆盖部分参数 */
+  function setParams(p) {
+    if (p && typeof p === 'object') Object.keys(p).forEach(function(k){ if (k in params) params[k] = p[k]; });
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+   *  音乐自适应行为
+   *
+   *  根据实时 BPM、能量分布、bass 特征自动调整 params 乘数，
+   *  实现不同风格音乐的差异化视觉响应：
+   *
+   *  慢歌（BPM<90, 低 RMS）：柔和呼吸，弱鼓点，淡 hihat
+   *  流行/EDM（BPM>120, 高能）：强劲 kick，快速呼吸，高 hihat
+   *  摇滚/重金属（中高 BPM, 高 RMS, 高 bass-to-mid）：强 kick, bass
+   *  Dubstep/低频（低 BPM, 极高 bass burst）：夸张 bass 冲击波
+   *
+   *  所有适配值通过低通滤波平滑过渡（tau ~3-5s），避免突变
+   * ════════════════════════════════════════════════════════════ */
+  var adapt = {
+    breath : 1.0,   // 呼吸幅度乘数
+    kick   : 1.0,   // 鼓点强度乘数
+    bass   : 1.0,   // Bass 冲击波乘数
+    hihat  : 1.0,   // 高频闪烁乘数
+    vocal  : 1.0,   // 人声流场乘数
+    chorus : 1.0,   // 副歌扩张乘数
+  };
+
+  /** 记录中期平均统计（用于风格推断）*/
+  var adaptStats = {
+    bassAvg    : 0.10,   // bass 中期平均
+    rmsAvg     : 0.06,   // RMS 中期平均
+    kickRate   : 0,      // kick 触发频率（每帧事件均值）
+    snareAvg   : 0,      // snare 中期平均
+  };
+
+  function tickAdapt(dt, arState, bpm) {
+    var rms   = arState.rms  || 0;
+    var bass  = arState.bass || 0;
+    var snare = arState.snare|| 0;
+    var kick  = arState.kick || 0;
+
+    /* 中期统计（tau 3.5s）*/
+    var tau3 = Math.min(1, dt / 3.5);
+    var tau5 = Math.min(1, dt / 5.0);
+    adaptStats.rmsAvg   += (rms   - adaptStats.rmsAvg)   * tau3;
+    adaptStats.bassAvg  += (bass  - adaptStats.bassAvg)  * tau3;
+    adaptStats.snareAvg += (snare - adaptStats.snareAvg) * tau3;
+    adaptStats.kickRate += (kick  - adaptStats.kickRate) * tau3;
+
+    /* ── 风格特征计算 ── */
+    var energy = adaptStats.rmsAvg;
+
+    // 速度系数：BPM 归一化 (60→0, 180→1)
+    var tempo = Math.max(0, Math.min(1, (bpm - 60) / 120));
+
+    // bass 主导度：bass 平均 vs RMS 的比值（越高→更 bass-heavy）
+    var bassDom = Math.max(0, Math.min(1,
+      (adaptStats.bassAvg / Math.max(0.02, adaptStats.rmsAvg) - 0.5) / 1.2));
+
+    // snare 存在感：normalized snare 平均（rock/pop 特征）
+    var snarePresence = Math.min(1, adaptStats.snareAvg * 8.0);
+
+    /* ── 目标参数计算 ──
+     *  原则：
+     *    能量越高 → kick/bass 效果越强
+     *    BPM 越高 → hihat/breathRate 更快
+     *    bass 主导 → bass 效果 boost, kick 微强
+     *    有 snare → vocal 稍抑（区分 beat-driven 与 melodic）
+     */
+    var targetBreath = 0.70 + energy * 1.20 + tempo * 0.35;     // 0.70~2.25
+    var targetKick   = 0.65 + energy * 1.60 + bassDom * 0.40;   // 0.65~2.65
+    var targetBass   = 0.60 + bassDom * 1.40 + energy * 0.80;   // 0.60~2.80
+    var targetHihat  = 0.50 + tempo * 1.10 + energy * 0.50;     // 0.50~2.10
+    var targetVocal  = 0.80 + (1.0 - snarePresence) * 0.60 + energy * 0.30;  // 0.80~1.70
+    var targetChorus = 0.80 + energy * 0.80 + bassDom * 0.30;   // 0.80~1.90
+
+    /* 钳制：最低 0.4（保证任何情况都有效果），最高 2.0 */
+    function ca(v) { return Math.max(0.4, Math.min(2.0, v)); }
+    targetBreath = ca(targetBreath);
+    targetKick   = ca(targetKick);
+    targetBass   = ca(targetBass);
+    targetHihat  = ca(targetHihat);
+    targetVocal  = ca(targetVocal);
+    targetChorus = ca(targetChorus);
+
+    /* 低通平滑（tau 4s → 约 4 秒缓慢跟随，不突变） */
+    adapt.breath  += (targetBreath  - adapt.breath)  * tau5;
+    adapt.kick    += (targetKick    - adapt.kick)    * tau5;
+    adapt.bass    += (targetBass    - adapt.bass)    * tau5;
+    adapt.hihat   += (targetHihat   - adapt.hihat)   * tau5;
+    adapt.vocal   += (targetVocal   - adapt.vocal)   * tau5;
+    adapt.chorus  += (targetChorus  - adapt.chorus)  * tau5;
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+   *  公开 state 快照
+   * ════════════════════════════════════════════════════════════ */
+  var state = {
+    dropState: 'IDLE',
+    breathRate: 0, breathAmt: 0,
+    bpm: 120,
+    spring: 0,
+    chorus: 0,
+    isChorus: false,
+    isDrop: false,
+    adapt: adapt,       // 只读：当前自适应乘数（可在调试面板展示）
+  };
+
+  /* ══════════════════════════════════════════════════════════════
+   *  主 tick
+   * ════════════════════════════════════════════════════════════ */
+  function tick(dt) {
+    dt = Math.max(0.001, Math.min(0.08, dt || 0.016));
+
+    var AR  = g.AudioReactive;
+    var uni = g.uniforms;
+    if (!AR || !uni) return;
+
+    var arState = AR.state;
+    var kickVal = arState.kick  || 0;
+    var dropVal = arState.drop  || 0;
+    var rmsVal  = arState.rms   || 0;
+    var bassVal = arState.bass  || 0;
+    var fluxVal = arState.flux  || 0;
+
+    var midVal    = uni.uMid    ? uni.uMid.value    : 0;
+    var trebleVal = uni.uTreble ? uni.uTreble.value : 0;
+    var energyVal = uni.uEnergy ? uni.uEnergy.value : rmsVal;
+
+    updateBpmFromKick(kickVal, dt);
+
+    // Beat Pulse → 弹簧冲量（降低触发阈值，加大冲量）
+    if (kickVal > 0.38 && kickVal > prevKickVal * 1.10) {
+      kickSpring(clamp01(kickVal) * 1.6);
+    }
+    tickSpring(dt);
+
+    tickBreath(dt, energyVal, bpmEstimate);
+    tickHiHat(trebleVal, dt);
+    tickVocal(midVal, bassVal, dt);
+    tickChorus(dropVal, energyVal, dt);
+
+    var shock = tickShockwaves(bassVal, dt);
+    tickDropSequence(dropVal, kickVal, dt);
+    tickChorusBurst(dropVal, kickVal, dt);   // ★ 高潮爆炸再生系统
+
+    // ── 爆发残留衰减（tau 2.8s → 粒子缓缓漂回）────────────────
+    burstResidue = follow(burstResidue, 0, 0.001, 2.8, dt);
+    // ── 热焰色温冷却（tau 1.8s → 橙白 → 冷蓝过渡）─────────────
+    heatGlow     = follow(heatGlow,     0, 0.001, 1.8, dt);
+    // ── 副歌涡旋：跟随 chorusLevel，快升慢降 ─────────────────
+    vortexSpin   = follow(vortexSpin, chorusLevel, 0.55, 2.2, dt);
+
+    // ── 暗晕脉冲：kick 强命中时触发边缘压暗 ──────────────────
+    if (kickVal > 0.52 && kickVal > prevKickVal * 1.15) {
+      _triggerVignette(kickVal * 0.80);
+    }
+
+    // 音乐自适应：根据风格特征自动调整效果乘数（可由 params.adapt 关闭）
+    if (params.adapt) {
+      tickAdapt(dt, arState, bpmEstimate);
+    }
+
+    _writeUniforms(shock);
+
+    state.dropState  = dropState;
+    state.breathRate = breathRate;
+    state.breathAmt  = breathAmt;
+    state.bpm        = Math.round(bpmEstimate);
+    state.spring     = springPos;
+    state.chorus     = chorusLevel;
+    state.isChorus   = chorusLevel > 0.20;
+    state.isDrop     = dropState !== 'IDLE';
+
+    prevKickVal = kickVal;
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+   *  reset
+   * ════════════════════════════════════════════════════════════ */
+  function reset() {
+    springPos    = 0;  springVel    = 0;
+    breathPhase  = 0;  breathRate   = 0.35;  breathAmt = 0.06;
+    hihatSmooth  = 0;  vocalSmooth  = 0;
+    chorusLevel  = 0;  chorusPeak   = 0;
+    dropState    = 'IDLE';
+    dropPhaseTimer = 0;
+    dropGatherVal  = 0;  dropBurstVal = 0;
+    chorusSustainTime = 0;
+    burstResidue = 0;  heatGlow = 0;  vortexSpin = 0;  _prevDropVal = 0;
+    shockwaves   = [];
+    bassOnsetCooldown = 0;
+    prevBassVal  = 0;
+    prevKickVal  = 0;
+    bpmKickTimes = [];
+    globalTime   = 0;
+    // ★ 高潮爆炸再生系统重置
+    CB_STATE      = 'IDLE';
+    cbTimer       = 0;
+    cBurstVal     = 0;  cWhiteVal    = 0;
+    cRegatherVal  = 0;  cKickBoost   = 0;
+    lastCBurstAt  = -30;
+    cbChorusSustain = 0; _cbDropPrev = 0;
+    // 自适应参数重置为中性值（1.0），切歌时不保留上一首的风格特征
+    adapt.breath = 1.0; adapt.kick = 1.0; adapt.bass = 1.0;
+    adapt.hihat  = 1.0; adapt.vocal = 1.0; adapt.chorus = 1.0;
+    adaptStats.rmsAvg = 0.06; adaptStats.bassAvg = 0.10;
+    adaptStats.snareAvg = 0;  adaptStats.kickRate = 0;
+    _writeUniforms(null);
+  }
+
+  /* ── 导出 ─────────────────────────────────────────────────── */
+  g.ParticleBehavior = { tick: tick, reset: reset, state: state, setParams: setParams, params: params };
+
+})(window);
