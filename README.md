@@ -1,3 +1,11 @@
-# Susumusic
-沉浸式音乐播放器
-下载：https://github.com/SUsuzmx/Susumusic/releases/download/v1.1.1/Susumusic-1.1.1-Setup.exe
+# 下载依赖
+npm install
+
+# 调试
+**桌面端调试**
+npm start
+**Web端调试**
+npm run web
+
+# 桌面应用打包
+npm run build:win
